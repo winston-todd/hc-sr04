@@ -1,8 +1,10 @@
-obj-m:= hcsr04.o
-KDIR := /lib/modules/$(shell uname -r)/build
+obj-m:= range_sensor.o
+KDIR := $(KDIR)
 PWD := $(shell pwd)
 
 default:
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
 
+deploy: default
+	./scripts/deploy
 

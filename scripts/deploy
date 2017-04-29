@@ -1,0 +1,17 @@
+#!/bin/bash
+
+MODULE=range_sensor.ko
+USER=root
+HOST=192.168.0.5
+REMOTE_PATH=modules/$MODULE
+
+rsync $MODULE $USER@$HOST:$REMOTE_PATH
+
+ssh $USER@$HOST <<-ENDSSH
+
+	cd ~/modules
+	rmmod $MODULE
+	insmod $MODULE
+
+ENDSSH
+

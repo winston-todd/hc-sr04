@@ -19,8 +19,8 @@
 #include <linux/sched.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("Sergio Tanzilli, OtherCrashOverride");
-MODULE_DESCRIPTION("Driver for HC-SR04 ultrasonic sensor");
+MODULE_AUTHOR("Sergio Tanzilli, OtherCrashOverride, Winston Todd");
+MODULE_DESCRIPTION("Driver for RadioShack ultrasonic sensor (sku 2760342)");
 
 
 // TODO: Refactor to allow multiple instances for using more
@@ -29,115 +29,134 @@ MODULE_DESCRIPTION("Driver for HC-SR04 ultrasonic sensor");
 //       each require a hardware entry thus limiting it to 
 //       four (8 / 2 = 4).
 
-typedef enum _HCSR04STATUS
+typedef enum range_sensor_status
 {
-	HCSR04STATUS_READY = 0,
-	HCSR04STATUS_WAITING_FOR_ECHO_START,
-	HCSR04STATUS_WAITING_FOR_ECHO_STOP,
-	HCSR04STATUS_COMPLETE
-} HCSR04STATUS;
+	RANGE_SENSOR_STATUS_READY = 0,
+	RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_START,
+	RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_END,
+	RANGE_SENSOR_STATUS_COMPLETE
+} range_sensor_status_t;
 
 
 static int rising_irq = -1;
 static int falling_irq = -1;
 
-volatile static HCSR04STATUS status = HCSR04STATUS_READY;
-volatile static ktime_t echo_start;
-volatile static ktime_t echo_end;
+volatile static range_sensor_status_t status = RANGE_SENSOR_STATUS_READY;
+volatile static ktime_t response_start;
+volatile static ktime_t response_end;
 
 DECLARE_WAIT_QUEUE_HEAD(wq);
 
-static const char* GPIO_OWNER = "hcsr04";
+static const char* GPIO_OWNER = "range_sensor";
+
+static int signal_gpio = 102;
+module_param(signal_gpio, int, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(signal_gpio, "Signal GPIO pin number");
 
 
-// Default GPIOs.  Use parameters during module load to override.
-// TODO: add IRQ setting parameters
-static int trigger_gpio = 104;	// J2 - Pin16
-module_param(trigger_gpio, int, S_IRUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(trigger_gpio, "Trigger GPIO pin number");
-
-static int echo_gpio = 102;		// J2 - Pin18
-module_param(echo_gpio, int, S_IRUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(echo_gpio, "Echo GPIO pin number");
-
-
-// This function is called when you write something on /sys/class/hcsr04/value
-static ssize_t hcsr04_value_write(struct class *class, struct class_attribute *attr, const char *buf, size_t len)
+// This function is called when you write something on /sys/class/range_sensor/value
+static ssize_t range_sensor_value_write(struct class *class, struct class_attribute *attr, const char *buf, size_t len)
 {
 	// Currently unused
 	return len;
 }
 
-// This function is called when you read /sys/class/hcsr04/value
+// This function is called when you read /sys/class/range_sensor/value
 // Note: https://www.kernel.org/doc/Documentation/filesystems/sysfs.txt
 //		 "sysfs allocates a buffer of size (PAGE_SIZE) and passes it to the
 //		 method."
-static ssize_t hcsr04_value_read(struct class *class, struct class_attribute *attr, char *buf)
+static ssize_t range_sensor_value_read(struct class *class, struct class_attribute *attr, char *buf)
 {
-	int waitResult;
-	int returnValue;
+	int wait_result;
+	int return_value;
+	int rtc;
 
-	// Set the status first to ensure its valid when IRQ fires
-	status = HCSR04STATUS_WAITING_FOR_ECHO_START;
+	// Set the signal gpio direction to output so we can send a pulse
+	rtc = amlogic_gpio_direction_output(signal_gpio, 0, GPIO_OWNER);
+	if (rtc != 0)
+	{
+		printk(KERN_ERR "Signal GPIO direction set failed.");
+		goto fail;
+	}
 
-	// Send a 10uS impulse to the TRIGGER line
-	amlogic_set_value(trigger_gpio, 1, GPIO_OWNER);
-	udelay(10);
-	amlogic_set_value(trigger_gpio, 0, GPIO_OWNER);
+	// Pulse the signal line to initiate a range scan
+	udelay(2);
+	amlogic_set_value(signal_gpio, 1, GPIO_OWNER);
+	udelay(5);
+	amlogic_set_value(signal_gpio, 0, GPIO_OWNER);
 
-	// Timemout is 38ms if no obstacle detected according to spec
-	waitResult = wait_event_timeout(wq, status == HCSR04STATUS_COMPLETE, 38 * HZ / 1000);
-	status = HCSR04STATUS_READY;
+	// Set the status to RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_START,
+	// so the irq handler knows to interpret the next rising edge as the
+	// beginning of the response pulse
+	status = RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_START;
 
-	if (waitResult == 0)
+	// Set the signal gpio as input so we can receive the response
+	rtc = amlogic_gpio_direction_input(signal_gpio, GPIO_OWNER);
+	if (rtc != 0)
+	{
+		printk(KERN_ERR "Signal GPIO direction set failed.");
+		goto fail;
+	}
+
+	// Wait up to 32ms for a response
+	wait_result = wait_event_timeout(wq, status == RANGE_SENSOR_STATUS_COMPLETE, 32 * HZ / 1000);
+	status = RANGE_SENSOR_STATUS_READY;
+
+	if (wait_result == 0)
 	{	// Timeout occured
-		returnValue = sprintf(buf, "%d\n", -1);
+		return_value = sprintf(buf, "%d\n", -1);
 	}
 	else
 	{
-		returnValue = sprintf(buf, "%lld\n", ktime_to_us(ktime_sub(echo_end, echo_start)));
+		return_value = sprintf(buf, "%lld\n", ktime_to_us(ktime_sub(response_end, response_start)));
 	}
 
-	return returnValue;
+	return return_value;
+
+fail:
+	status = RANGE_SENSOR_STATUS_READY;
+	return sprintf(buf, "%d\n", -1);
 }
 
-// Sysfs definitions for hcsr04 class
-static struct class_attribute hcsr04_class_attrs[] =
+// Sysfs definitions for range_sensor class
+static struct class_attribute range_sensor_class_attrs[] =
 {
-	__ATTR(value, S_IRUGO | S_IWUSR, hcsr04_value_read, hcsr04_value_write),
+	__ATTR(value, S_IRUGO | S_IWUSR, range_sensor_value_read, range_sensor_value_write),
 	__ATTR_NULL,
 };
 
 // Name of directory created in /sys/class
-static struct class hcsr04_class =
+static struct class range_sensor_class =
 {
-	.name = "hcsr04",
+	.name = "range_sensor",
 	.owner = THIS_MODULE,
-	.class_attrs = hcsr04_class_attrs,
+	.class_attrs = range_sensor_class_attrs,
 };
 
-// Interrupt handler on ECHO signal
+// Interrupt handler on signal_gpio
 static irqreturn_t gpio_isr_rising(int irq, void *data)
 {
 	// Rising edge
-	if (status == HCSR04STATUS_WAITING_FOR_ECHO_START)
+	if (status == RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_START)
 	{
-		echo_start = ktime_get();
-		echo_end = echo_start;
+		response_start = ktime_get();
+		response_end = response_start;
 
-		status = HCSR04STATUS_WAITING_FOR_ECHO_STOP;
+		status = RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_END;
+
 	}
 
 	return IRQ_HANDLED;
 }
 
+// Interrupt handler on signal_gpio
 static irqreturn_t gpio_isr_falling(int irq, void *data)
 {
 	// Falling edge
-	if (status == HCSR04STATUS_WAITING_FOR_ECHO_STOP)
+	if (status == RANGE_SENSOR_STATUS_WAITING_FOR_RESPONSE_END)
 	{
-		echo_end = ktime_get();
-		status = HCSR04STATUS_COMPLETE;
+		response_end = ktime_get();
+		status = RANGE_SENSOR_STATUS_COMPLETE;
 
 		wake_up(&wq);
 	}
@@ -145,80 +164,51 @@ static irqreturn_t gpio_isr_falling(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int hcsr04_init(void)
+static int range_sensor_init(void)
 {
 	int rtc;
+	int irq_banks[2];
 
-	printk(KERN_INFO "HC-SR04 driver initializing.\n");
-	printk(KERN_INFO "Trigger GPIO: %d.\n", trigger_gpio);
-	printk(KERN_INFO "Echo GPIO: %d.\n", echo_gpio);
-
-	if (class_register(&hcsr04_class) < 0)
+	printk(KERN_INFO "RadioShack Ultrasonic Range Sensor driver initializing.\n");
+	printk(KERN_INFO "Signal GPIO: %d.\n", signal_gpio);
+	if (class_register(&range_sensor_class) < 0)
 	{
 		goto fail_1;
 	}
 
 
-	// Setup TRIGGER gpio
-	rtc = amlogic_gpio_request(trigger_gpio, GPIO_OWNER);
+	// Setup signal gpio
+	rtc = amlogic_gpio_request(signal_gpio, GPIO_OWNER);
 	if (rtc != 0)
 	{
-		printk(KERN_ERR "Trigger GPIO request failed.\n");
+		printk(KERN_ERR "Switch GPIO request failed.\n");
 		goto fail_2;
 	}
 
-	rtc = amlogic_gpio_direction_output(trigger_gpio, 0, GPIO_OWNER);
+	rtc = amlogic_gpio_direction_input(signal_gpio, GPIO_OWNER);
 	if (rtc != 0)
 	{
-		printk(KERN_ERR "Trigger GPIO direction set failed.");
-		goto fail_3;
+		printk(KERN_ERR "Signal GPIO direction set failed.");
+		goto fail_2;
 	}
 
-	amlogic_set_value(trigger_gpio, 0, GPIO_OWNER);
+	amlogic_disable_pullup(signal_gpio, GPIO_OWNER);
 
-
-	// Setup ECHO gpio
-	rtc = amlogic_gpio_request(echo_gpio, GPIO_OWNER);
-	if (rtc != 0) 
-	{
-		printk(KERN_ERR "Echo GPIO request failed.\n");
-		goto fail_3;
-	}
-
-	rtc = amlogic_gpio_direction_input(echo_gpio, GPIO_OWNER);
-	if (rtc != 0) 
-	{
-		printk(KERN_ERR "Echo GPIO direction set failed.\n");
-		goto fail_4;
-	}
-
-	//amlogic_set_pull_up_down(echo_gpio, 1, ECHO_OWNER);
-	amlogic_disable_pullup(echo_gpio, GPIO_OWNER);
-
-
-	// http://forum.odroid.com/viewtopic.php?f=115&t=8958#p70802
-	/*
-		IRQ Trigger Select : (0 ~ 3)
-			GPIO_IRQ_HIGH = 0, GPIO_IRQ_LOW = 1, GPIO_IRQ_RISING = 2, GPIO_IRQ_FALLING = 3
-
-		IRQ Filter Select : 7
-			Value 0 : No Filtering, Value 1 ~ 7 : value * 3 * 111nS(delay)
-	*/
 
 	// Set RISING irq
 	rising_irq = (GPIO_IRQ0 + INT_GPIO_0);
-	rtc = amlogic_gpio_to_irq(echo_gpio, GPIO_OWNER, AML_GPIO_IRQ(rising_irq, FILTER_NUM1, GPIO_IRQ_RISING));
+	rtc = amlogic_gpio_to_irq(signal_gpio, GPIO_OWNER, AML_GPIO_IRQ(rising_irq, FILTER_NUM1, GPIO_IRQ_RISING));
 	if (rtc < 0)
 	{
 		printk(KERN_ERR "Rising IRQ mapping failed.\n");
-		goto fail_4;
+		goto fail_2;
 	}
 
-	rtc = request_irq(rising_irq, (irq_handler_t)gpio_isr_rising, IRQF_DISABLED, "hc-sr04", NULL);
+	rtc = request_irq(rising_irq, (irq_handler_t)gpio_isr_rising, IRQF_DISABLED, "range_sensor", NULL);
 	if (rtc)
 	{
 		printk(KERN_ERR "Rising IRQ:%d request failed. (Error=%d)\n", rising_irq, rtc);
-		goto fail_4;
+		goto fail_2;
 	}
 	else
 	{
@@ -228,18 +218,18 @@ static int hcsr04_init(void)
 
 	// Set FALLING irq
 	falling_irq = (GPIO_IRQ1 + INT_GPIO_0);
-	rtc = amlogic_gpio_to_irq(echo_gpio, GPIO_OWNER, AML_GPIO_IRQ(falling_irq, FILTER_NUM1, GPIO_IRQ_FALLING));
+	rtc = amlogic_gpio_to_irq(signal_gpio, GPIO_OWNER, AML_GPIO_IRQ(falling_irq, FILTER_NUM1, GPIO_IRQ_FALLING));
 	if (rtc < 0)
 	{
 		printk(KERN_ERR "Falling IRQ mapping failed.\n");
-		goto fail_4;
+		goto fail_2;
 	}
 
-	rtc = request_irq(falling_irq, (irq_handler_t)gpio_isr_falling, IRQF_DISABLED, "hc-sr04", NULL);
+	rtc = request_irq(falling_irq, (irq_handler_t)gpio_isr_falling, IRQF_DISABLED, "range_sensor", NULL);
 	if (rtc)
 	{
 		printk(KERN_ERR "Falling IRQ:%d request failed. (Error=%d)\n", falling_irq, rtc);
-		goto fail_5;
+		goto fail_3;
 	}
 	else
 	{
@@ -247,48 +237,48 @@ static int hcsr04_init(void)
 	}
 
 
-	printk(KERN_INFO "HC-SR04 driver installed.\n");
+	printk(KERN_INFO "RadioShack Ultrasonic Range Sensor driver installed.\n");
 	return 0;
 
-fail_5:
+fail_3:
+	meson_free_irq(signal_gpio, irq_banks);
+
 	if (rising_irq != -1)
 	{
 		free_irq(rising_irq, NULL);
 	}
 
-fail_4:
-	amlogic_gpio_free(echo_gpio, GPIO_OWNER);
-
-fail_3:
-	amlogic_gpio_free(trigger_gpio, GPIO_OWNER);
-
 fail_2:
-	class_unregister(&hcsr04_class);
+	amlogic_gpio_free(signal_gpio, GPIO_OWNER);
+
+	class_unregister(&range_sensor_class);
 
 fail_1:
 	return -1;
 
 }
 
-static void hcsr04_exit(void)
+static void range_sensor_exit(void)
 {
-	if (falling_irq != -1)
-	{
-		free_irq(falling_irq, NULL);
-	}
+	int irq_banks[2];
+
+	disable_irq(falling_irq);
+	disable_irq(rising_irq);
+
+	meson_free_irq(signal_gpio, irq_banks);
 
 	if (rising_irq != -1)
-	{
 		free_irq(rising_irq, NULL);
-	}
 
-	amlogic_gpio_free(echo_gpio, GPIO_OWNER);
-	amlogic_gpio_free(trigger_gpio, GPIO_OWNER);
+	if (falling_irq != -1)
+		free_irq(falling_irq, NULL);
 
-	class_unregister(&hcsr04_class);
+	amlogic_gpio_free(signal_gpio, GPIO_OWNER);
 
-	printk(KERN_INFO "HC-SR04 driver removed.\n");
+	class_unregister(&range_sensor_class);
+
+	printk(KERN_INFO "RadioShack Ultrasonic Range Sensor driver removed.\n");
 }
 
-module_init(hcsr04_init);
-module_exit(hcsr04_exit);
+module_init(range_sensor_init);
+module_exit(range_sensor_exit);
